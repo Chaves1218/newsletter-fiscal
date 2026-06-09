@@ -3,10 +3,8 @@ name: Newsletter Fiscal Cooperflora
 
 on:
   schedule:
-    # Roda todo dia às 10h00 horário de Brasília (13:00 UTC)
-    - cron: "0 13 * * 1-5"   # segunda a sexta
-    # Para incluir sábado também, use: "0 13 * * 1-6"
-    # Para todos os dias:             "0 13 * * *"
+    # Roda toda segunda-feira às 10h00 horário de Brasília (13:00 UTC)
+    - cron: "0 13 * * 1"
   workflow_dispatch:           # permite rodar manualmente pelo GitHub
 
 jobs:
