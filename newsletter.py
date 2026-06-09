@@ -9,7 +9,7 @@ from resend import Resend
 RESEND_API_KEY = os.environ["RESEND_API_KEY"]
 FROM_EMAIL     = "newsletter@resend.dev"            # domínio gratuito do Resend, sem DNS próprio
 TO_EMAILS      = ["guilherme.chaves@cooperflora.com.br"]
-LOGO_PATH      = "logo_cooperflora.png"             # logo na raiz do repositório
+LOGO_PATH      = None                               # logo desativada
 
 # ── Fontes RSS ─────────────────────────────────────────────────
 FEEDS = [
@@ -72,7 +72,7 @@ def fetch_feed(feed: dict) -> list[dict]:
         print(f"[ERRO] {feed['name']}: {e}")
         return []
 
-def build_html(sections: dict, logo_b64: str) -> str:
+def build_html(sections: dict) -> str:
     hoje = datetime.now().strftime("%d/%m/%Y")
     html = f"""
 <!DOCTYPE html>
@@ -99,8 +99,7 @@ def build_html(sections: dict, logo_b64: str) -> str:
 </head>
 <body>
 <div class="container">
-  <div class="header">
-    <img src="data:image/png;base64,{logo_b64}" alt="Cooperflora">
+      <div class="header">
     <h1>Newsletter Fiscal — Cooperflora</h1>
     <p>Edição de {hoje} | Atualização automática diária</p>
   </div>
@@ -142,7 +141,7 @@ def send_newsletter(html: str):
 # ── Main ───────────────────────────────────────────────────────
 def main():
     print(f"[{datetime.now():%H:%M:%S}] Iniciando coleta de feeds...")
-    logo_b64 = logo_base64(LOGO_PATH)
+    logo_b64 = None
     sections = {}
     for feed in FEEDS:
         print(f"  → Coletando: {feed['name']}")
@@ -151,7 +150,7 @@ def main():
     total = sum(len(v) for v in sections.values())
     print(f"[INFO] {total} itens relevantes encontrados.")
 
-    html = build_html(sections, logo_b64)
+    html = build_html(sections)
     send_newsletter(html)
 
 if __name__ == "__main__":
