@@ -2,6 +2,7 @@ import requests
 import resend
 import os
 import feedparser
+import xml.etree.ElementTree as ET
 from datetime import datetime, date, timedelta
 
 # ── Configurações ──────────────────────────────────────────────
@@ -9,113 +10,118 @@ RESEND_API_KEY = os.environ["RESEND_API_KEY"]
 FROM_EMAIL     = "newsletter@resend.dev"
 TO_EMAILS      = ["guilherme.chaves@cooperflora.com.br"]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (newsletter-fiscal-cooperflora)",
-    "Accept":     "application/json, text/plain, */*",
-}
+HEADERS = {"User-Agent": "Mozilla/5.0 (newsletter-fiscal-cooperflora)"}
 
 # ── Período: semana anterior (seg a sex) ───────────────────────
 hoje        = date.today()
 data_inicio = hoje - timedelta(days=7)
 data_fim    = hoje - timedelta(days=1)
 
-TERMOS_DOU = [
+# ── Termos de busca ────────────────────────────────────────────
+TERMOS = [
     "ICMS", "PIS", "COFINS", "IPI", "CSLL", "IRPJ",
-    "reforma tributaria", "nota fiscal eletronica", "CT-e",
+    "reforma tributaria", "nota fiscal", "CT-e",
     "cooperativa", "floricultura", "DIFAL",
     "substituicao tributaria", "Simples Nacional",
+    "instrucao normativa", "portaria", "convenio ICMS",
 ]
 
-# ── API oficial DOU (Imprensa Nacional) ────────────────────────
-def buscar_dou() -> list[dict]:
+# ── API LexML (Senado Federal) — SRU ──────────────────────────
+def buscar_lexml() -> list[dict]:
     """
-    Usa a API interna da Imprensa Nacional — a mesma usada pelo
-    buscador oficial em https://www.in.gov.br/consulta/
-    Endpoint descoberto via Ro-DOU (ferramenta oficial do governo federal).
+    API pública do LexML — mantida pelo Senado Federal.
+    Sem cadastro, sem autenticação. Padrão SRU internacional.
+    Cobre: leis, decretos, portarias, instruções normativas,
+    convênios ICMS, ajustes SINIEF, protocolos — tudo publicado no DOU.
     """
+    NS = {
+        "srw":    "http://www.loc.gov/zing/srw/",
+        "dc":     "http://purl.org/dc/elements/1.1/",
+        "srw_dc": "info:srw/schema/1/dc-schema",
+    }
+
     resultados = {}
+    ini = data_inicio.strftime("%Y-%m-%d")
+    fim = data_fim.strftime("%Y-%m-%d")
 
-    for dia in range(7):
-        data = data_inicio + timedelta(days=dia)
-        if data.weekday() >= 5:
-            continue
+    for termo in TERMOS:
+        try:
+            # Busca por termo + filtro de data de publicação
+            query = f'dc.description any "{termo}" and dc.date >= "{ini}" and dc.date <= "{fim}"'
+            params = {
+                "operation":      "searchRetrieve",
+                "version":        "1.1",
+                "query":          query,
+                "maximumRecords": "10",
+                "recordSchema":   "dc",
+            }
+            r = requests.get(
+                "https://www.lexml.gov.br/busca/SRU",
+                params=params,
+                headers=HEADERS,
+                timeout=20,
+            )
+            if r.status_code != 200:
+                continue
 
-        data_str = data.strftime("%d-%m-%Y")
+            root = ET.fromstring(r.content)
+            records = root.findall(".//srw:record", NS)
 
-        for termo in TERMOS_DOU:
-            try:
-                url = "https://www.in.gov.br/consulta/-/buscar/dou"
-                params = {
-                    "q":            termo,
-                    "s":            "do1",      # Seção 1 — atos normativos
-                    "exactDate":    data_str,
-                    "sortType":     0,
-                    "delta":        5,
-                    "orgPrin":      "",
-                    "orgSub":       "",
-                    "artType":      "",
-                }
-                r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+            for rec in records:
+                data_el   = rec.find(".//dc:date",  NS)
+                titulo_el = rec.find(".//dc:title", NS)
+                urn_el    = rec.find(".//urn",       {})
 
-                # Tenta JSON (API retorna JSON quando aceito)
-                ct = r.headers.get("Content-Type","")
-                if "json" in ct:
-                    data_json = r.json()
-                    hits = data_json.get("content", data_json.get("items", []))
-                    for hit in hits[:3]:
-                        titulo = hit.get("title", hit.get("titulo",""))
-                        resumo = hit.get("content", hit.get("resumo",""))[:300]
-                        href   = hit.get("urlTitle", hit.get("url",""))
-                        if not href.startswith("http"):
-                            href = "https://www.in.gov.br" + href
-                        if titulo and titulo not in resultados:
-                            resultados[titulo] = {
-                                "titulo": titulo,
-                                "resumo": resumo,
-                                "url":    href,
-                                "orgao":  hit.get("artCategory", "DOU — Seção 1"),
-                                "data":   data.strftime("%d/%m/%Y"),
-                            }
-                else:
-                    # Fallback: parse HTML com regex simples
-                    import re
-                    titulos = re.findall(r'class="title-marker[^"]*"[^>]*>([^<]+)<', r.text)
-                    links   = re.findall(r'href="(/web/dou/-/[^"]+)"', r.text)
-                    for i, t in enumerate(titulos[:3]):
-                        t = t.strip()
-                        if t and t not in resultados:
-                            href = f"https://www.in.gov.br{links[i]}" if i < len(links) else "https://www.in.gov.br/consulta"
-                            resultados[t] = {
-                                "titulo": t,
-                                "resumo": f"Publicado em {data.strftime('%d/%m/%Y')} — acesse o ato completo.",
-                                "url":    href,
-                                "orgao":  "DOU — Seção 1",
-                                "data":   data.strftime("%d/%m/%Y"),
-                            }
+                # Fallback sem namespace para urn
+                if urn_el is None:
+                    for el in rec.iter():
+                        if el.tag.endswith("urn") or el.tag == "urn":
+                            urn_el = el
+                            break
 
-            except Exception as e:
-                print(f"[ERRO DOU] {termo} {data_str}: {e}")
+                titulo = titulo_el.text.strip() if titulo_el is not None and titulo_el.text else ""
+                data_pub = data_el.text.strip() if data_el is not None and data_el.text else ""
+                urn    = urn_el.text.strip() if urn_el is not None and urn_el.text else ""
+                link   = f"https://www.lexml.gov.br/urn/{urn}" if urn else "https://www.lexml.gov.br"
+
+                # Formata data
+                try:
+                    data_fmt = datetime.strptime(data_pub, "%Y-%m-%d").strftime("%d/%m/%Y")
+                except Exception:
+                    data_fmt = data_pub
+
+                if titulo and titulo not in resultados:
+                    resultados[titulo] = {
+                        "titulo": titulo,
+                        "resumo": f"Publicado em {data_fmt} — clique para acessar o texto completo no portal LexML do Senado Federal.",
+                        "url":    link,
+                        "orgao":  "LexML / Senado Federal",
+                        "data":   data_fmt,
+                    }
+
+        except Exception as e:
+            print(f"[ERRO LexML] {termo}: {e}")
 
     items = list(resultados.values())
-    items.sort(key=lambda x: x["data"], reverse=True)
-    print(f"     {len(items)} itens encontrados no DOU")
+    items.sort(key=lambda x: x.get("data",""), reverse=True)
+    print(f"     {len(items)} itens encontrados no LexML")
     return items[:15]
 
-# ── Receita Federal — múltiplos RSS ───────────────────────────
+# ── Receita Federal — RSS ──────────────────────────────────────
 def buscar_receita() -> list[dict]:
     kws = ["icms","pis","cofins","ipi","csll","irpj","tributar",
            "cooperativ","reforma","nota fiscal","sped","difal",
-           "obrigacao acessoria","instrucao normativa"]
-    feeds_urls = [
+           "instrucao normativa","portaria","obrigacao acessoria"]
+    urls = [
         "https://www.gov.br/receitafederal/pt-br/@@search?portal_type=News+Item&sort_on=effective&sort_order=descending&RSS=true",
         "https://www.gov.br/receitafederal/pt-br/assuntos/noticias/@@search?portal_type=News+Item&sort_on=effective&sort_order=descending&RSS=true",
     ]
-    items = []
+    items  = []
     vistos = set()
-    for url in feeds_urls:
+    for url in urls:
         try:
             feed = feedparser.parse(url)
-            for e in feed.entries[:30]:
+            for e in feed.entries[:40]:
                 pub = e.get("published_parsed") or e.get("updated_parsed")
                 if pub:
                     pub_date = date(*pub[:3])
@@ -126,60 +132,27 @@ def buscar_receita() -> list[dict]:
                     titulo = e.get("title","")
                     if titulo not in vistos:
                         vistos.add(titulo)
+                        pub_fmt = date(*pub[:3]).strftime("%d/%m/%Y") if pub else "—"
                         items.append({
                             "titulo": titulo,
                             "resumo": e.get("summary","")[:300],
                             "url":    e.get("link",""),
                             "orgao":  "Receita Federal",
-                            "data":   date(*pub[:3]).strftime("%d/%m/%Y") if pub else "—",
+                            "data":   pub_fmt,
                         })
         except Exception as ex:
-            print(f"[ERRO Receita RSS] {ex}")
+            print(f"[ERRO Receita] {ex}")
 
-    items.sort(key=lambda x: x["data"], reverse=True)
+    items.sort(key=lambda x: x.get("data",""), reverse=True)
     print(f"     {len(items[:8])} itens encontrados na Receita Federal")
     return items[:8]
 
-# ── CONFAZ — RSS alternativo ───────────────────────────────────
-def buscar_confaz() -> list[dict]:
-    """Usa RSS do Portal da Fazenda como alternativa ao CONFAZ direto."""
-    feeds_urls = [
-        "https://www.gov.br/fazenda/pt-br/@@search?portal_type=News+Item&sort_on=effective&sort_order=descending&RSS=true",
-    ]
-    kws = ["convênio","protocolo","confaz","icms","ajuste sinief","ato cotepe","tributar"]
-    items = []
-    try:
-        for url in feeds_urls:
-            feed = feedparser.parse(url)
-            for e in feed.entries[:30]:
-                pub = e.get("published_parsed") or e.get("updated_parsed")
-                if pub:
-                    pub_date = date(*pub[:3])
-                    if not (data_inicio <= pub_date <= data_fim):
-                        continue
-                txt = (e.get("title","") + e.get("summary","")).lower()
-                if any(k in txt for k in kws):
-                    items.append({
-                        "titulo": e.get("title",""),
-                        "resumo": e.get("summary","")[:300],
-                        "url":    e.get("link",""),
-                        "orgao":  "CONFAZ / Fazenda",
-                        "data":   date(*pub[:3]).strftime("%d/%m/%Y") if pub else "—",
-                    })
-    except Exception as ex:
-        print(f"[ERRO CONFAZ/Fazenda] {ex}")
-
-    items.sort(key=lambda x: x["data"], reverse=True)
-    print(f"     {len(items[:5])} itens encontrados no CONFAZ/Fazenda")
-    return items[:5]
-
 # ── Montar HTML ────────────────────────────────────────────────
-def build_html(dou_items, receita_items, confaz_items) -> str:
+def build_html(lexml_items, receita_items) -> str:
     hoje_fmt   = datetime.now().strftime("%d/%m/%Y")
     inicio_fmt = data_inicio.strftime("%d/%m/%Y")
     fim_fmt    = data_fim.strftime("%d/%m/%Y")
-    total      = len(dou_items) + len(receita_items) + len(confaz_items)
-    link_dou   = f"https://www.in.gov.br/leiturajornal?data={data_fim.strftime('%d-%m-%Y')}&secao=do1"
+    total      = len(lexml_items) + len(receita_items)
 
     def render_items(items):
         if not items:
@@ -214,30 +187,37 @@ def build_html(dou_items, receita_items, confaz_items) -> str:
     </p>
   </div>
 
+  <!-- Estatísticas -->
   <div style="background:#e8f5e9;padding:12px 28px;font-size:13px;color:#2e7d32;border-bottom:1px solid #c8e6c9;">
     ✅ <strong>{total} publicações relevantes</strong> encontradas nesta semana
-    · DOU: {len(dou_items)} · Receita Federal: {len(receita_items)} · CONFAZ/Fazenda: {len(confaz_items)}<br>
-    <a href="{link_dou}" style="color:#1a5276;">🔗 Acessar DOU da semana</a>
+    · LexML/Legislação: {len(lexml_items)} · Receita Federal: {len(receita_items)}<br>
+    <a href="https://www.lexml.gov.br" style="color:#1a5276;">🔗 Portal LexML — Senado Federal</a>
+    &nbsp;|&nbsp;
+    <a href="https://www.gov.br/receitafederal/pt-br/assuntos/noticias" style="color:#1a5276;">🔗 Notícias Receita Federal</a>
   </div>
 
+  <!-- LexML -->
   <div style="padding:20px 28px;border-bottom:2px solid #4a7c3f;">
-    <h2 style="color:#4a7c3f;font-size:15px;border-left:4px solid #4a7c3f;padding-left:10px;">📋 Diário Oficial da União — Seção 1</h2>
-    {render_items(dou_items)}
+    <h2 style="color:#4a7c3f;font-size:15px;border-left:4px solid #4a7c3f;padding-left:10px;">
+      📋 Legislação Federal — LexML / Senado Federal
+    </h2>
+    <p style="font-size:12px;color:#888;margin:0 0 12px;">
+      Inclui: Leis · Decretos · Portarias · Instruções Normativas · Convênios ICMS · Protocolos CONFAZ
+    </p>
+    {render_items(lexml_items)}
   </div>
 
-  <div style="padding:20px 28px;border-bottom:2px solid #4a7c3f;">
-    <h2 style="color:#4a7c3f;font-size:15px;border-left:4px solid #4a7c3f;padding-left:10px;">🏛️ Receita Federal — Notícias</h2>
-    {render_items(receita_items)}
-  </div>
-
+  <!-- Receita Federal -->
   <div style="padding:20px 28px;">
-    <h2 style="color:#4a7c3f;font-size:15px;border-left:4px solid #4a7c3f;padding-left:10px;">📜 CONFAZ / Fazenda — Atos e Convênios</h2>
-    {render_items(confaz_items)}
+    <h2 style="color:#4a7c3f;font-size:15px;border-left:4px solid #4a7c3f;padding-left:10px;">
+      🏛️ Receita Federal — Notícias e Atos
+    </h2>
+    {render_items(receita_items)}
   </div>
 
   <div style="background:#f0f0f0;padding:16px 28px;font-size:11px;color:#999;text-align:center;">
     Newsletter gerada automaticamente toda segunda-feira às 10h00 | Cooperflora<br>
-    Fontes: Diário Oficial da União · Receita Federal · CONFAZ · Ministério da Fazenda
+    Fontes: LexML (Senado Federal) · Receita Federal
   </div>
 
 </div>
@@ -257,13 +237,11 @@ def send_newsletter(html: str):
 # ── Main ───────────────────────────────────────────────────────
 def main():
     print(f"[{datetime.now():%H:%M:%S}] Iniciando coleta semanal ({data_inicio} a {data_fim})...")
-    print("  → Consultando DOU...")
-    dou_items     = buscar_dou()
+    print("  → Consultando LexML (Senado Federal)...")
+    lexml_items   = buscar_lexml()
     print("  → Consultando Receita Federal...")
     receita_items = buscar_receita()
-    print("  → Consultando CONFAZ/Fazenda...")
-    confaz_items  = buscar_confaz()
-    html = build_html(dou_items, receita_items, confaz_items)
+    html = build_html(lexml_items, receita_items)
     send_newsletter(html)
 
 if __name__ == "__main__":
