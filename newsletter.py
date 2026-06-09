@@ -3,7 +3,7 @@ import requests
 import base64
 import os
 from datetime import datetime
-from resend import Resend
+import resend
 
 # ── Configurações ──────────────────────────────────────────────
 RESEND_API_KEY = os.environ["RESEND_API_KEY"]
@@ -127,7 +127,7 @@ def build_html(sections: dict) -> str:
     return html
 
 def send_newsletter(html: str):
-    client = Resend(api_key=RESEND_API_KEY)
+    resend.api_key = RESEND_API_KEY
     hoje = datetime.now().strftime("%d/%m/%Y")
     params = {
         "from": FROM_EMAIL,
@@ -135,8 +135,8 @@ def send_newsletter(html: str):
         "subject": f"📋 Newsletter Fiscal Cooperflora — {hoje}",
         "html": html,
     }
-    resp = client.emails.send(params)
-    print(f"[OK] E-mail enviado! ID: {resp.id}")
+    resp = resend.Emails.send(params)
+    print(f"[OK] E-mail enviado! ID: {resp['id']}")
 
 # ── Main ───────────────────────────────────────────────────────
 def main():
