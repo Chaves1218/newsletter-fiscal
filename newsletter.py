@@ -3,133 +3,175 @@ import resend
 import os
 import feedparser
 from datetime import datetime, date, timedelta
-from bs4 import BeautifulSoup
 
 # ── Configurações ──────────────────────────────────────────────
 RESEND_API_KEY = os.environ["RESEND_API_KEY"]
 FROM_EMAIL     = "newsletter@resend.dev"
 TO_EMAILS      = ["guilherme.chaves@cooperflora.com.br"]
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (newsletter-fiscal-cooperflora)"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (newsletter-fiscal-cooperflora)",
+    "Accept":     "application/json, text/plain, */*",
+}
 
 # ── Período: semana anterior (seg a sex) ───────────────────────
 hoje        = date.today()
-data_inicio = hoje - timedelta(days=7)  # última segunda
-data_fim    = hoje - timedelta(days=1)  # última sexta
+data_inicio = hoje - timedelta(days=7)
+data_fim    = hoje - timedelta(days=1)
 
 TERMOS_DOU = [
-    "ICMS", "PIS COFINS", "IPI", "CSLL IRPJ",
+    "ICMS", "PIS", "COFINS", "IPI", "CSLL", "IRPJ",
     "reforma tributaria", "nota fiscal eletronica", "CT-e",
     "cooperativa", "floricultura", "DIFAL",
     "substituicao tributaria", "Simples Nacional",
 ]
 
-# ── Busca no DOU ───────────────────────────────────────────────
+# ── API oficial DOU (Imprensa Nacional) ────────────────────────
 def buscar_dou() -> list[dict]:
+    """
+    Usa a API interna da Imprensa Nacional — a mesma usada pelo
+    buscador oficial em https://www.in.gov.br/consulta/
+    Endpoint descoberto via Ro-DOU (ferramenta oficial do governo federal).
+    """
     resultados = {}
-    for termo in TERMOS_DOU:
-        for dia in range(7):
-            data = data_inicio + timedelta(days=dia)
-            if data.weekday() >= 5:  # pula sábado e domingo
-                continue
+
+    for dia in range(7):
+        data = data_inicio + timedelta(days=dia)
+        if data.weekday() >= 5:
+            continue
+
+        data_str = data.strftime("%d-%m-%Y")
+
+        for termo in TERMOS_DOU:
             try:
-                api_url = "https://www.in.gov.br/consulta/-/buscar/dou"
+                url = "https://www.in.gov.br/consulta/-/buscar/dou"
                 params = {
-                    "q":         termo,
-                    "s":         "do1",
-                    "exactDate": data.strftime("%d-%m-%Y"),
-                    "sortType":  0,
+                    "q":            termo,
+                    "s":            "do1",      # Seção 1 — atos normativos
+                    "exactDate":    data_str,
+                    "sortType":     0,
+                    "delta":        5,
+                    "orgPrin":      "",
+                    "orgSub":       "",
+                    "artType":      "",
                 }
-                r    = requests.get(api_url, params=params, headers=HEADERS, timeout=15)
-                soup = BeautifulSoup(r.text, "html.parser")
-                cards = soup.select(".resultado-pesquisa, article.resultado, .search-results article")
-                for card in cards[:3]:
-                    titulo_el = card.select_one("h5, h4, h3, .titulo-ato")
-                    link_el   = card.select_one("a")
-                    resumo_el = card.select_one("p, .resumo, .conteudo")
-                    titulo = titulo_el.get_text(strip=True) if titulo_el else ""
-                    link   = link_el["href"] if link_el and link_el.get("href") else ""
-                    resumo = resumo_el.get_text(strip=True)[:300] if resumo_el else ""
-                    if titulo and titulo not in resultados:
-                        if not link.startswith("http"):
-                            link = "https://www.in.gov.br" + link
-                        resultados[titulo] = {
-                            "titulo": titulo,
-                            "resumo": resumo,
-                            "url":    link,
-                            "orgao":  "DOU — Seção 1",
-                            "data":   data.strftime("%d/%m/%Y"),
-                        }
+                r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+
+                # Tenta JSON (API retorna JSON quando aceito)
+                ct = r.headers.get("Content-Type","")
+                if "json" in ct:
+                    data_json = r.json()
+                    hits = data_json.get("content", data_json.get("items", []))
+                    for hit in hits[:3]:
+                        titulo = hit.get("title", hit.get("titulo",""))
+                        resumo = hit.get("content", hit.get("resumo",""))[:300]
+                        href   = hit.get("urlTitle", hit.get("url",""))
+                        if not href.startswith("http"):
+                            href = "https://www.in.gov.br" + href
+                        if titulo and titulo not in resultados:
+                            resultados[titulo] = {
+                                "titulo": titulo,
+                                "resumo": resumo,
+                                "url":    href,
+                                "orgao":  hit.get("artCategory", "DOU — Seção 1"),
+                                "data":   data.strftime("%d/%m/%Y"),
+                            }
+                else:
+                    # Fallback: parse HTML com regex simples
+                    import re
+                    titulos = re.findall(r'class="title-marker[^"]*"[^>]*>([^<]+)<', r.text)
+                    links   = re.findall(r'href="(/web/dou/-/[^"]+)"', r.text)
+                    for i, t in enumerate(titulos[:3]):
+                        t = t.strip()
+                        if t and t not in resultados:
+                            href = f"https://www.in.gov.br{links[i]}" if i < len(links) else "https://www.in.gov.br/consulta"
+                            resultados[t] = {
+                                "titulo": t,
+                                "resumo": f"Publicado em {data.strftime('%d/%m/%Y')} — acesse o ato completo.",
+                                "url":    href,
+                                "orgao":  "DOU — Seção 1",
+                                "data":   data.strftime("%d/%m/%Y"),
+                            }
+
             except Exception as e:
-                print(f"[ERRO DOU] {termo} {data}: {e}")
+                print(f"[ERRO DOU] {termo} {data_str}: {e}")
 
     items = list(resultados.values())
     items.sort(key=lambda x: x["data"], reverse=True)
     print(f"     {len(items)} itens encontrados no DOU")
     return items[:15]
 
-# ── Receita Federal — RSS ──────────────────────────────────────
+# ── Receita Federal — múltiplos RSS ───────────────────────────
 def buscar_receita() -> list[dict]:
     kws = ["icms","pis","cofins","ipi","csll","irpj","tributar",
-           "cooperativ","reforma","nota fiscal","sped","difal"]
-    try:
-        feed  = feedparser.parse(
-            "https://www.gov.br/receitafederal/pt-br/@@search"
-            "?portal_type=News+Item&sort_on=effective&sort_order=descending&RSS=true"
-        )
-        items = []
-        for e in feed.entries[:50]:
-            # Verifica se está dentro da semana
-            pub = e.get("published_parsed") or e.get("updated_parsed")
-            if pub:
-                pub_date = date(*pub[:3])
-                if not (data_inicio <= pub_date <= data_fim):
-                    continue
-            txt = (e.get("title","") + e.get("summary","")).lower()
-            if any(k in txt for k in kws):
-                items.append({
-                    "titulo": e.get("title",""),
-                    "resumo": e.get("summary","")[:300],
-                    "url":    e.get("link",""),
-                    "orgao":  "Receita Federal",
-                    "data":   date(*pub[:3]).strftime("%d/%m/%Y") if pub else "—",
-                })
-        items.sort(key=lambda x: x["data"], reverse=True)
-        print(f"     {len(items[:8])} itens encontrados na Receita Federal")
-        return items[:8]
-    except Exception as ex:
-        print(f"[ERRO Receita] {ex}")
-        return []
+           "cooperativ","reforma","nota fiscal","sped","difal",
+           "obrigacao acessoria","instrucao normativa"]
+    feeds_urls = [
+        "https://www.gov.br/receitafederal/pt-br/@@search?portal_type=News+Item&sort_on=effective&sort_order=descending&RSS=true",
+        "https://www.gov.br/receitafederal/pt-br/assuntos/noticias/@@search?portal_type=News+Item&sort_on=effective&sort_order=descending&RSS=true",
+    ]
+    items = []
+    vistos = set()
+    for url in feeds_urls:
+        try:
+            feed = feedparser.parse(url)
+            for e in feed.entries[:30]:
+                pub = e.get("published_parsed") or e.get("updated_parsed")
+                if pub:
+                    pub_date = date(*pub[:3])
+                    if not (data_inicio <= pub_date <= data_fim):
+                        continue
+                txt = (e.get("title","") + e.get("summary","")).lower()
+                if any(k in txt for k in kws):
+                    titulo = e.get("title","")
+                    if titulo not in vistos:
+                        vistos.add(titulo)
+                        items.append({
+                            "titulo": titulo,
+                            "resumo": e.get("summary","")[:300],
+                            "url":    e.get("link",""),
+                            "orgao":  "Receita Federal",
+                            "data":   date(*pub[:3]).strftime("%d/%m/%Y") if pub else "—",
+                        })
+        except Exception as ex:
+            print(f"[ERRO Receita RSS] {ex}")
 
-# ── CONFAZ — scraping ──────────────────────────────────────────
+    items.sort(key=lambda x: x["data"], reverse=True)
+    print(f"     {len(items[:8])} itens encontrados na Receita Federal")
+    return items[:8]
+
+# ── CONFAZ — RSS alternativo ───────────────────────────────────
 def buscar_confaz() -> list[dict]:
+    """Usa RSS do Portal da Fazenda como alternativa ao CONFAZ direto."""
+    feeds_urls = [
+        "https://www.gov.br/fazenda/pt-br/@@search?portal_type=News+Item&sort_on=effective&sort_order=descending&RSS=true",
+    ]
+    kws = ["convênio","protocolo","confaz","icms","ajuste sinief","ato cotepe","tributar"]
+    items = []
     try:
-        r    = requests.get(
-            "https://www.confaz.fazenda.gov.br/legislacao/convenios",
-            headers=HEADERS, timeout=15
-        )
-        soup = BeautifulSoup(r.text, "html.parser")
-        items = []
-        for a in soup.select("a")[:80]:
-            txt  = a.get_text(strip=True)
-            href = a.get("href","")
-            if any(k in txt.lower() for k in ["convênio","protocolo","ajuste sinief","ato cotepe"]):
-                if len(txt) > 10:
-                    link = href if href.startswith("http") else "https://www.confaz.fazenda.gov.br" + href
+        for url in feeds_urls:
+            feed = feedparser.parse(url)
+            for e in feed.entries[:30]:
+                pub = e.get("published_parsed") or e.get("updated_parsed")
+                if pub:
+                    pub_date = date(*pub[:3])
+                    if not (data_inicio <= pub_date <= data_fim):
+                        continue
+                txt = (e.get("title","") + e.get("summary","")).lower()
+                if any(k in txt for k in kws):
                     items.append({
-                        "titulo": txt,
-                        "resumo": "Acesse o ato completo no portal do CONFAZ.",
-                        "url":    link,
-                        "orgao":  "CONFAZ",
-                        "data":   "—",
+                        "titulo": e.get("title",""),
+                        "resumo": e.get("summary","")[:300],
+                        "url":    e.get("link",""),
+                        "orgao":  "CONFAZ / Fazenda",
+                        "data":   date(*pub[:3]).strftime("%d/%m/%Y") if pub else "—",
                     })
-            if len(items) >= 8:
-                break
-        print(f"     {len(items)} itens encontrados no CONFAZ")
-        return items
     except Exception as ex:
-        print(f"[ERRO CONFAZ] {ex}")
-        return []
+        print(f"[ERRO CONFAZ/Fazenda] {ex}")
+
+    items.sort(key=lambda x: x["data"], reverse=True)
+    print(f"     {len(items[:5])} itens encontrados no CONFAZ/Fazenda")
+    return items[:5]
 
 # ── Montar HTML ────────────────────────────────────────────────
 def build_html(dou_items, receita_items, confaz_items) -> str:
@@ -142,18 +184,18 @@ def build_html(dou_items, receita_items, confaz_items) -> str:
     def render_items(items):
         if not items:
             return '<p style="color:#999;font-style:italic;">Nenhuma publicação relevante encontrada nesta semana.</p>'
-        # Agrupa por data
         por_data = {}
         for it in items:
             d = it.get("data","—")
             por_data.setdefault(d, []).append(it)
-
         html = ""
         for d in sorted(por_data.keys(), reverse=True):
             html += f'<p style="font-size:12px;font-weight:bold;color:#4a7c3f;margin:12px 0 6px;">📅 {d}</p>'
             for it in por_data[d]:
+                orgao = f'<span style="font-size:11px;color:#888;">{it.get("orgao","")}</span><br>' if it.get("orgao") else ""
                 html += f"""
                 <div style="margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid #eee;">
+                  {orgao}
                   <a href="{it['url']}" style="color:#1a5276;font-weight:bold;font-size:14px;text-decoration:none;">{it['titulo']}</a>
                   <p style="color:#555;font-size:13px;margin:4px 0 0;">{it['resumo']}...</p>
                 </div>"""
@@ -172,10 +214,9 @@ def build_html(dou_items, receita_items, confaz_items) -> str:
     </p>
   </div>
 
-  <!-- Estatísticas -->
   <div style="background:#e8f5e9;padding:12px 28px;font-size:13px;color:#2e7d32;border-bottom:1px solid #c8e6c9;">
     ✅ <strong>{total} publicações relevantes</strong> encontradas nesta semana
-    · DOU: {len(dou_items)} · Receita Federal: {len(receita_items)} · CONFAZ: {len(confaz_items)}<br>
+    · DOU: {len(dou_items)} · Receita Federal: {len(receita_items)} · CONFAZ/Fazenda: {len(confaz_items)}<br>
     <a href="{link_dou}" style="color:#1a5276;">🔗 Acessar DOU da semana</a>
   </div>
 
@@ -190,13 +231,13 @@ def build_html(dou_items, receita_items, confaz_items) -> str:
   </div>
 
   <div style="padding:20px 28px;">
-    <h2 style="color:#4a7c3f;font-size:15px;border-left:4px solid #4a7c3f;padding-left:10px;">📜 CONFAZ — Atos e Convênios</h2>
+    <h2 style="color:#4a7c3f;font-size:15px;border-left:4px solid #4a7c3f;padding-left:10px;">📜 CONFAZ / Fazenda — Atos e Convênios</h2>
     {render_items(confaz_items)}
   </div>
 
   <div style="background:#f0f0f0;padding:16px 28px;font-size:11px;color:#999;text-align:center;">
     Newsletter gerada automaticamente toda segunda-feira às 10h00 | Cooperflora<br>
-    Fontes: Diário Oficial da União · Receita Federal · CONFAZ
+    Fontes: Diário Oficial da União · Receita Federal · CONFAZ · Ministério da Fazenda
   </div>
 
 </div>
@@ -220,7 +261,7 @@ def main():
     dou_items     = buscar_dou()
     print("  → Consultando Receita Federal...")
     receita_items = buscar_receita()
-    print("  → Consultando CONFAZ...")
+    print("  → Consultando CONFAZ/Fazenda...")
     confaz_items  = buscar_confaz()
     html = build_html(dou_items, receita_items, confaz_items)
     send_newsletter(html)
